@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# pub — publish a file to Fileverse dDocs, print the shareable link
+# share — publish a file to Fileverse dDocs, print the shareable link
 set -uo pipefail
 
-FILE="${1:?Usage: pub <filepath>}"; FILE="${FILE#./}"
+FILE="${1:?Usage: share <filepath>}"; FILE="${FILE#./}"
 API="http://127.0.0.1:8001"
 ENV_FILE="$HOME/.fileverse/.env"
 

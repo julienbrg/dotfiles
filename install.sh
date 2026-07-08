@@ -5,8 +5,8 @@ DOTFILES="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # repo path -> target path
 LINKS=(
-  "bin/pub:$HOME/.local/bin/pub"
-  "claude/commands/pub.md:$HOME/.claude/commands/pub.md"
+  "bin/share:$HOME/.local/bin/share"
+  "claude/commands/share.md:$HOME/.claude/commands/share.md"
 )
 
 for entry in "${LINKS[@]}"; do

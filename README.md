@@ -12,13 +12,13 @@ Symlinks each file into its target location, backing up anything already there a
 
 ## Contents
 
-- `bin/pub` — publish a file to Fileverse dDocs
-- `claude/commands/pub.md` — Claude Code slash command for `pub`
+- `bin/share` — publish a file to Fileverse dDocs
+- `claude/commands/share.md` — Claude Code slash command for `share`
 
 ## Fileverse
 
-`pub` needs a Fileverse API key at `~/.fileverse/.env` (`API_KEY=...`). This file is
+`share` needs a Fileverse API key at `~/.fileverse/.env` (`API_KEY=...`). This file is
 not part of this repo — it's a secret and isn't managed by `install.sh`.
 
-On a new machine, run `fileverse-api` once to generate it, then `pub` will start
+On a new machine, run `fileverse-api` once to generate it, then `share` will start
 the local server automatically as needed.
