@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# pub — publish a file to Fileverse dDocs, print the shareable link
+set -uo pipefail
+
+FILE="${1:?Usage: pub <filepath>}"; FILE="${FILE#./}"
+API="http://127.0.0.1:8001"
+ENV_FILE="$HOME/.fileverse/.env"
+
+STARTED_SERVER=0
+SERVER_PID=""
+
+cleanup() {
+  if [ "$STARTED_SERVER" -eq 1 ] && [ -n "$SERVER_PID" ]; then
+    echo "Shutting down fileverse server (pid $SERVER_PID)..." >&2
+    kill "$SERVER_PID" 2>/dev/null
+    sleep 2
+    pkill -f "fileverse-api" 2>/dev/null
+  fi
+}
+trap cleanup EXIT
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+[ -f "$FILE" ] || die "file not found: $FILE"
+[ -f "$ENV_FILE" ] || die "env file not found: $ENV_FILE (run fileverse-api once first)"
+
+KEY=$(grep -m1 -Ei '^[[:space:]]*(API_KEY|APIKEY)[[:space:]]*=' "$ENV_FILE" | cut -d= -f2- | tr -d '[:space:]"'"'" || true)
+[ -n "$KEY" ] || die "no API key found in $ENV_FILE"
+
+# --- 1. Ensure server is running (remember if WE started it) ---
+if ! curl -s --max-time 3 "$API/ping" > /dev/null 2>&1; then
+  echo "Server not running, starting it..." >&2
+  nohup fileverse-api --apiKey "$KEY" > "$HOME/.fileverse/server.log" 2>&1 &
+  SERVER_PID=$!
+  STARTED_SERVER=1
+  UP=0
+  for _ in $(seq 1 45); do
+    sleep 1
+    if curl -s --max-time 3 "$API/ping" > /dev/null 2>&1; then UP=1; break; fi
+  done
+  if [ "$UP" -ne 1 ]; then
+    echo "ERROR: server did not become ready within 45s. Last log lines:" >&2
+    tail -n 20 "$HOME/.fileverse/server.log" >&2
+    exit 1
+  fi
+else
+  echo "Server already running — will leave it running when done." >&2
+fi
+
+# --- 2. Create the ddoc ---
+RESP=$(curl -s -X POST "$API/api/ddocs?apiKey=$KEY" -F "file=@$FILE" || true)
+[ -n "$RESP" ] || die "empty response from create call (is the server healthy?)"
+DDOC_ID=$(printf '%s' "$RESP" | python3 -c "
+import json,sys
+try:
+    d=json.loads(sys.stdin.read(),strict=False)
+    print(d.get('data',d).get('ddocId',''))
+except Exception:
+    pass
+" || true)
+[ -n "$DDOC_ID" ] || die "create failed: $(printf '%.300s' "$RESP")"
+echo "Created ddoc $DDOC_ID, waiting for on-chain sync..." >&2
+
+# --- 3. Poll for sync (retry failed events once) ---
+RETRIED=0
+STATUS=""
+for _ in $(seq 1 50); do
+  RES=$(curl -s "$API/api/ddocs/$DDOC_ID?apiKey=$KEY" | python3 -c "
+import json,sys
+try:
+    d=json.loads(sys.stdin.read(),strict=False)
+    d=d.get('data',d)
+    print(d.get('syncStatus',''), d.get('link') or '')
+except Exception:
+    print('parse-error')
+" || true)
+  STATUS=${RES%% *}; LINK=${RES#* }
+  if [ "$STATUS" = "synced" ] && [ -n "$LINK" ]; then
+    echo "Published: $(basename "$FILE")"
+    echo "ddocId: $DDOC_ID"
+    echo "link: $LINK"
+    exit 0
+  fi
+  if [ "$STATUS" = "failed" ] && [ "$RETRIED" -eq 0 ]; then
+    echo "Sync failed, retrying events..." >&2
+    curl -s -X POST "$API/api/events/retry-failed?apiKey=$KEY" > /dev/null
+    RETRIED=1
+  fi
+  sleep 3
+done
+die "timed out waiting for sync (ddocId: $DDOC_ID, last status: $STATUS)"
