@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # share — publish a file to Fileverse dDocs, print the shareable link
+# Re-sharing a file that was already published updates the same doc, so the
+# link stays the same. Pass a ddocId as second argument to target a doc
+# explicitly (e.g. one published before the ledger existed).
 set -uo pipefail
 
-FILE="${1:?Usage: share <filepath>}"; FILE="${FILE#./}"
+FILE="${1:?Usage: share <filepath> [ddocId]}"; FILE="${FILE#./}"
+UPDATE_ID="${2:-}"
 API="http://127.0.0.1:8001"
 ENV_FILE="$HOME/.fileverse/.env"
+LEDGER="$HOME/.fileverse/shared.tsv"
 
 STARTED_SERVER=0
 SERVER_PID=""
@@ -21,11 +26,33 @@ trap cleanup EXIT
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+parse_ddoc_id() {
+  printf '%s' "$1" | python3 -c "
+import json,sys
+try:
+    d=json.loads(sys.stdin.read(),strict=False)
+    print(d.get('data',d).get('ddocId',''))
+except Exception:
+    pass
+"
+}
+
 [ -f "$FILE" ] || die "file not found: $FILE"
 [ -f "$ENV_FILE" ] || die "env file not found: $ENV_FILE (run fileverse-api once first)"
+ABS="$(cd "$(dirname "$FILE")" && pwd)/$(basename "$FILE")"
 
 KEY=$(grep -m1 -Ei '^[[:space:]]*(API_KEY|APIKEY)[[:space:]]*=' "$ENV_FILE" | cut -d= -f2- | tr -d '[:space:]"'"'" || true)
 [ -n "$KEY" ] || die "no API key found in $ENV_FILE"
+
+# Ledger lookup: same file published before -> update it instead of creating
+FROM_LEDGER=0
+if [ -z "$UPDATE_ID" ] && [ -f "$LEDGER" ]; then
+  UPDATE_ID=$(awk -F'\t' -v p="$ABS" '$1==p{print $2; exit}' "$LEDGER" || true)
+  if [ -n "$UPDATE_ID" ]; then
+    FROM_LEDGER=1
+    echo "Already published as ddoc $UPDATE_ID — updating it, link stays the same." >&2
+  fi
+fi
 
 # --- 1. Ensure server is running (remember if WE started it) ---
 if ! curl -s --max-time 3 "$API/ping" > /dev/null 2>&1; then
@@ -47,19 +74,32 @@ else
   echo "Server already running — will leave it running when done." >&2
 fi
 
-# --- 2. Create the ddoc ---
-RESP=$(curl -s -X POST "$API/api/ddocs?apiKey=$KEY" -F "file=@$FILE" || true)
-[ -n "$RESP" ] || die "empty response from create call (is the server healthy?)"
-DDOC_ID=$(printf '%s' "$RESP" | python3 -c "
-import json,sys
-try:
-    d=json.loads(sys.stdin.read(),strict=False)
-    print(d.get('data',d).get('ddocId',''))
-except Exception:
-    pass
-" || true)
-[ -n "$DDOC_ID" ] || die "create failed: $(printf '%.300s' "$RESP")"
-echo "Created ddoc $DDOC_ID, waiting for on-chain sync..." >&2
+# --- 2. Create or update the ddoc ---
+ACTION="create"
+DDOC_ID=""
+if [ -n "$UPDATE_ID" ]; then
+  ACTION="update"
+  RESP=$(curl -s -X PUT "$API/api/ddocs/$UPDATE_ID?apiKey=$KEY" -F "file=@$FILE" || true)
+  DDOC_ID=$(parse_ddoc_id "$RESP" || true)
+  if [ -z "$DDOC_ID" ]; then
+    if [ "$FROM_LEDGER" -eq 1 ]; then
+      echo "Update of $UPDATE_ID failed ($(printf '%.120s' "$RESP")) — publishing as a new doc instead." >&2
+      ACTION="create"
+    else
+      die "update failed: $(printf '%.300s' "$RESP")"
+    fi
+  fi
+fi
+if [ "$ACTION" = "create" ]; then
+  RESP=$(curl -s -X POST "$API/api/ddocs?apiKey=$KEY" -F "file=@$FILE" || true)
+  DDOC_ID=$(parse_ddoc_id "$RESP" || true)
+  [ -n "$DDOC_ID" ] || die "create failed: $(printf '%.300s' "$RESP")"
+fi
+if [ "$ACTION" = "update" ]; then
+  echo "Updated ddoc $DDOC_ID, waiting for on-chain sync..." >&2
+else
+  echo "Created ddoc $DDOC_ID, waiting for on-chain sync..." >&2
+fi
 
 # --- 3. Poll for sync (retry failed events once) ---
 RETRIED=0
@@ -76,7 +116,15 @@ except Exception:
 " || true)
   STATUS=${RES%% *}; LINK=${RES#* }
   if [ "$STATUS" = "synced" ] && [ -n "$LINK" ]; then
-    echo "Published: $(basename "$FILE")"
+    # Remember file -> doc so the next share of this file updates in place
+    { [ -f "$LEDGER" ] && awk -F'\t' -v p="$ABS" '$1!=p' "$LEDGER"; true; } > "$LEDGER.tmp"
+    printf '%s\t%s\t%s\t%s\n' "$ABS" "$DDOC_ID" "$LINK" "$(date +%Y-%m-%d)" >> "$LEDGER.tmp"
+    mv "$LEDGER.tmp" "$LEDGER"
+    if [ "$ACTION" = "update" ]; then
+      echo "Updated: $(basename "$FILE")"
+    else
+      echo "Published: $(basename "$FILE")"
+    fi
     echo "ddocId: $DDOC_ID"
     echo "link: $LINK"
     exit 0
